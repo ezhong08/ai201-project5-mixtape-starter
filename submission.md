@@ -275,3 +275,90 @@ unaffected. Running the full suite (`pytest tests/`) shows the only remaining fa
 two `test_playlists.py` tests belonging to the separate Issue #5.
 
 ---
+
+### Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it**
+
+There was no notification test, so I wrote a regression test
+[tests/test_notifications.py](tests/test_notifications.py). It sets up a *sharer* who shared
+a song and a *friend*, then has the friend rate the song and checks the sharer's
+notifications. Two cases:
+
+- `test_rating_a_song_notifies_the_sharer` — friend rates the sharer's song → sharer should
+  get one `song_rated` notification.
+- `test_rating_your_own_song_does_not_notify` — sharer rates their own song → no notification
+  (you shouldn't be notified about your own action).
+
+Running `pytest tests/test_notifications.py -v` confirmed the bug: the self-rating case passed
+(no notification, correctly), but the friend-rates case failed — the sharer received **zero**
+notifications:
+
+```
+E   assert 0 == 1
+E    +  where 0 = len([])
+```
+
+This matches the report exactly: adding a song to a playlist notifies the sharer, but rating
+it notifies no one.
+
+**How I found the root cause**
+
+I opened [services/notification_service.py](services/notification_service.py) and compared its
+two interaction handlers side by side. `add_to_playlist` (the flow that *works*) ends with a
+clear notify step:
+
+```python
+if song.shared_by != added_by_user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_added_to_playlist",
+        body=f"{adder.username} added your song '{song.title}' ...",
+    )
+```
+
+`rate_song`, by contrast, validated the score, upserted the `Rating`, committed, and
+`return`ed — with **no** `create_notification` call anywhere. That was the moment it was
+clear: this isn't a broken notification, it's a *missing* one. The rating path simply never
+had the notify step that the playlist path has.
+
+**The root cause**
+
+`rate_song` never created a notification. It persisted the rating and returned, so the song's
+original sharer was never told their song had been rated. The two interaction handlers in the
+same file were inconsistent: `add_to_playlist` notified `song.shared_by`, but `rate_song`
+omitted that step entirely. It was a missing side effect, not a wrong comparison or a bad
+query.
+
+**My fix and side-effect check**
+
+I added the notify step to `rate_song`, mirroring `add_to_playlist` exactly — after the rating
+is committed, notify the song's sharer unless they are the one who rated it:
+
+```python
+db.session.commit()
+
+# Notify the person who originally shared the song (if it wasn't them who rated it)
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+    )
+
+return rating
+```
+
+This fixes the root cause because the rating flow now performs the same notify step as the
+playlist flow, so a friend's rating produces a `song_rated` notification for the sharer. The
+`song.shared_by != user_id` guard reuses the existing "don't notify yourself" convention, and
+the notification is created only after `commit()`, so a failed/invalid rating never generates
+a spurious notification.
+
+Side-effect check: both [tests/test_notifications.py](tests/test_notifications.py) cases pass
+(friend's rating notifies; self-rating doesn't). The rest of `rate_song` is unchanged, so the
+upsert behavior (new rating vs. updating an existing score) and the 1–5 validation still work,
+and the existing playlist-add notification path is untouched. The full suite's only remaining
+failures are the two `test_playlists.py` tests belonging to the separate Issue #5.
+
+---
