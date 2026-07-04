@@ -362,3 +362,67 @@ and the existing playlist-add notification path is untouched. The full suite's o
 failures are the two `test_playlists.py` tests belonging to the separate Issue #5.
 
 ---
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it**
+
+The existing [tests/test_playlists.py](tests/test_playlists.py) already covers this. It seeds a
+playlist with 5 songs (`Track 1`…`Track 5`) and asserts `get_playlist_songs` returns all five,
+in order. Running `pytest tests/test_playlists.py -v` showed two failures:
+
+```
+tests/test_playlists.py::test_playlist_returns_all_songs      FAILED
+tests/test_playlists.py::test_playlist_returns_songs_in_order FAILED
+```
+
+The diff was precise — the returned list was `['Track 1', 'Track 2', 'Track 3', 'Track 4']`,
+missing `Track 5`:
+
+```
+E   Right contains one more item: 'Track 5'
+```
+
+So the trigger is any non-empty playlist: whatever song sits in the last position is always
+dropped. The empty-playlist test (`test_empty_playlist_returns_empty_list`) still passed,
+which was a useful clue — the bug affected the *last element*, not the query or the ordering.
+
+**How I found the root cause**
+
+The failures pointed at [services/playlist_service.py](services/playlist_service.py),
+`get_playlist_songs`. The query itself is correct — it joins `playlist_entries`, filters by
+`playlist_id`, and orders by `asc(position)`, so `songs` is the full, correctly-ordered list.
+I traced that list to the single `return` statement:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+The `[:-1]` slice was the moment it clicked. Python's `[:-1]` returns every element *except
+the last one*, so the query fetches all N songs correctly and then the return statement throws
+the final one away. It also explains why the empty-playlist case passed: `[][:-1]` is still
+`[]`, so the bug is invisible when there's nothing to drop.
+
+**The root cause**
+
+`get_playlist_songs` sliced its result with `songs[:-1]` before serializing, which discards the
+last song in position order. The database query returned the complete, correctly-ordered set;
+the truncation happened purely in Python at the return. Nothing was wrong with the ordering,
+the join, or the positions — it was an off-by-one truncation of the output list.
+
+**My fix and side-effect check**
+
+I removed the slice so every fetched song is returned:
+
+```python
+return [song.to_dict() for song in songs]
+```
+
+This fixes the root cause because the correctly-ordered query result is now serialized in full,
+including the song in the final position. Nothing else in the function changed, so ordering
+(`asc(position)`) and the not-found `ValueError` behavior are preserved.
+
+Side-effect check: all three [tests/test_playlists.py](tests/test_playlists.py) tests now pass
+— all-songs-returned, correct-order, and the empty-playlist case (which still returns `[]`,
+since dropping the slice doesn't affect an empty list). I ran the entire suite
+(`pytest tests/`) and **all 17 tests pass** with no remaining failures.
