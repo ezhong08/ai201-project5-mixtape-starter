@@ -202,9 +202,10 @@ playlist) and are unrelated to this change.
 
 **How I reproduced it**
 
-There was no existing feed test, so I wrote one (`tests/test_feed.py`) that sets up a user
-with one friend and creates a single listening event for that friend, then calls
-`get_friends_listening_now`. I wrote two cases:
+There was no existing feed test, so I wrote a regression test
+[tests/test_feed.py](tests/test_feed.py) that sets up a user with one friend and creates a
+single listening event for that friend, then calls `get_friends_listening_now`. It has two
+cases:
 
 - `test_recent_listen_appears` — friend listened **10 minutes ago** → should appear.
 - `test_yesterdays_listen_does_not_appear` — friend listened **5 hours ago** → should *not*
@@ -267,8 +268,8 @@ This fixes the root cause because the cutoff now only admits events from the las
 so a friend who listened hours ago falls outside the window and is excluded — while someone
 actively listening in the last few minutes still appears.
 
-Side-effect check: both `test_feed.py` cases now pass (recent still shows, 5-hours-ago is
-gone). I confirmed I only touched the shared constant, not `get_activity_feed`, which
+Side-effect check: both [tests/test_feed.py](tests/test_feed.py) cases now pass (recent still
+shows, 5-hours-ago is gone). I confirmed I only touched the shared constant, not `get_activity_feed`, which
 intentionally ignores recency (it returns the most recent N events regardless of age) and is
 unaffected. Running the full suite (`pytest tests/`) shows the only remaining failures are the
 two `test_playlists.py` tests belonging to the separate Issue #5.
