@@ -197,3 +197,80 @@ the whole test suite (`pytest tests/`); the only remaining failures are the two
 playlist) and are unrelated to this change.
 
 ---
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it**
+
+There was no existing feed test, so I wrote one (`tests/test_feed.py`) that sets up a user
+with one friend and creates a single listening event for that friend, then calls
+`get_friends_listening_now`. I wrote two cases:
+
+- `test_recent_listen_appears` — friend listened **10 minutes ago** → should appear.
+- `test_yesterdays_listen_does_not_appear` — friend listened **5 hours ago** → should *not*
+  appear, because the feed is for people listening *right now*.
+
+Running `pytest tests/test_feed.py -v` confirmed the bug: the recent-listen case passed, but
+the 5-hours-ago case failed — the friend still showed up in the feed:
+
+```
+E   assert [{'friend': {...}}] == []
+E     Left contains one more item: ... 'listened_at': '2026-07-03T20:45:...'
+```
+
+I cross-checked this against the seed data, which documents the exact same expectation:
+[seed_data.py](seed_data.py) labels events "within the past 30 minutes" as ones that
+*should* appear in "listening now", and events from "1–14 days ago" (the oldest of which are
+only 2, 10, and 18 hours old) as ones that *should NOT* appear after the fix. Those 2–18h-old
+events are precisely the "people from yesterday" users were seeing.
+
+**How I found the root cause**
+
+I opened [services/feed_service.py](services/feed_service.py) and traced
+`get_friends_listening_now`. The recency filter itself is written correctly:
+
+```python
+cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
+...
+.filter(ListeningEvent.listened_at >= cutoff)
+```
+
+So the query logic is sound — which meant the problem had to be the threshold *value*, not the
+comparison. I looked up the constant at the top of the file:
+
+```python
+RECENT_THRESHOLD = timedelta(hours=24)
+```
+
+That was the moment it clicked: a 24-hour window is not "listening now" — it's "listening
+sometime in the last day." Anyone who listened up to 24 hours ago (i.e. yesterday) passes the
+`>= cutoff` filter. The value directly contradicts both the feature's name ("...Now") and the
+seed data's stated 30-minute expectation.
+
+**The root cause**
+
+The recency window `RECENT_THRESHOLD` was set to `timedelta(hours=24)`. The filter
+`listened_at >= now - 24h` therefore admits every listening event from the past full day, so
+friends who listened hours ago — yesterday — were treated as "listening now." The comparison
+operator and the query were correct; the single wrong value was the window size.
+
+**My fix and side-effect check**
+
+I changed the threshold to a true "now" window that matches the seed data's documented
+intent:
+
+```python
+RECENT_THRESHOLD = timedelta(minutes=30)
+```
+
+This fixes the root cause because the cutoff now only admits events from the last 30 minutes,
+so a friend who listened hours ago falls outside the window and is excluded — while someone
+actively listening in the last few minutes still appears.
+
+Side-effect check: both `test_feed.py` cases now pass (recent still shows, 5-hours-ago is
+gone). I confirmed I only touched the shared constant, not `get_activity_feed`, which
+intentionally ignores recency (it returns the most recent N events regardless of age) and is
+unaffected. Running the full suite (`pytest tests/`) shows the only remaining failures are the
+two `test_playlists.py` tests belonging to the separate Issue #5.
+
+---
